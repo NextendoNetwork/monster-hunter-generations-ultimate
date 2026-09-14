@@ -9,7 +9,5 @@ require (
 	github.com/lxzan/gws v1.10.0 // indirect
 )
 
-// MHGU's legacy PRUDP V1/UDP transport (see main.go) needs nextendo-nex's UDPServer type and
-// AuthConfig.UseFullConnectionDataForContext, neither of which exist in the published v0.1.4
-// above yet -- point at a local checkout with that work until a new release includes it.
+// Needs nextendo-nex main (AuthConfig.ContextResultTrailingU64, Matchmaking.OwnerLeaveUnregisters).
 replace github.com/NextendoNetwork/nextendo-nex => ../nextendo-nex
