@@ -64,11 +64,11 @@ go run .
 Configuration is entirely through environment variables — see [`example.env`](example.env). No
 secrets are baked into the source.
 
-**Build note:** MHGU's legacy PRUDP V1/UDP transport needs `nextendo-nex`'s `UDPServer` type and
-`AuthConfig.UseFullConnectionDataForContext`, which aren't in the latest published
-[`nextendo-nex`](https://github.com/NextendoNetwork/nextendo-nex) release yet — `go.mod` points at
-a local sibling checkout (`replace ... => ../nextendo-nex`) until a release includes that work.
-Clone `nextendo-nex` alongside this repo to build from source in the meantime.
+**Build note:** `go.mod` builds against a sibling
+[`nextendo-nex`](https://github.com/NextendoNetwork/nextendo-nex) checkout
+(`replace ... => ../nextendo-nex`). MHGU needs `AuthConfig.ContextResultTrailingU64` (its login
+result carries a trailing u64) and `Matchmaking.OwnerLeaveUnregisters` (a hub closes for everyone
+when its host leaves), so clone `nextendo-nex` at `main` alongside this repo.
 
 ## What this is not
 

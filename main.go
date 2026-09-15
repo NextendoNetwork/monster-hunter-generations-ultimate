@@ -54,8 +54,9 @@ var (
 	certFile     = envOr("CERT_FILE", "cert.pem")
 	keyFile      = envOr("KEY_FILE", "key.pem")
 
-	nextendoSecret = loadNextendoSecret()
-	requireAccount = os.Getenv("NEXTENDO_REQUIRE_ACCOUNT") == "1"
+	nextendoSecret  = loadNextendoSecret()
+	requireAccount  = os.Getenv("NEXTENDO_REQUIRE_ACCOUNT") == "1"
+	requiredVersion = os.Getenv("NEXTENDO_REQUIRED_VERSION")
 )
 
 func main() {
@@ -87,12 +88,9 @@ func main() {
 		SecureStationURL: secureURL,
 		ServerName:       "Monster Hunter Generations Ultimate",
 		SessionKeyLength: sessionKeyLen,
-		ResolveUser:      resolveUser,
-		// MHGU is a legacy, 3DS-derived title (unlike SSBU, which method 0x6's
-		// flat response shape was tuned for) -- try the older, fuller
-		// RVConnectionData shape LoginEx uses instead, since the flat shape has
-		// produced a persistent, invariant Core::BufferOverflow (2306-0116).
-		UseFullConnectionDataForContext: true,
+		ResolveUserEx:    resolveUser,
+		// MHGU's ValidateAndRequestTicketResult reads a trailing u64 after SourceKey.
+		ContextResultTrailingU64: true,
 	}
 	authEndpoint.Register(nex.ProtocolTicketGranting, authCfg.Handler())
 	authEndpoint.OnRMC = logRMC("Auth")
@@ -105,6 +103,8 @@ func main() {
 	secureEndpoint.SetSecureAccount(securePassword, securePID)
 
 	mm := nex.NewMatchmaking()
+	mm.OwnerLeaveUnregisters = true
+	mm.Endpoint = secureEndpoint
 	secureEndpoint.Register(nex.ProtocolSecureConnection, nex.SecureConnectionHandler())
 	secureEndpoint.Register(nex.ProtocolMatchmakeExtension, mm.ExtensionHandler())
 	secureEndpoint.Register(nex.ProtocolMatchMaking, mm.MatchMakingHandler())
@@ -121,6 +121,7 @@ func main() {
 	secureEndpoint.OnRMC = func(c *nex.Connection, req *nex.RMCMessage) {
 		logSecure(c, req)
 		noteRMC(c, req)
+		notePresenceSeen(c.PID)
 	}
 	secureEndpoint.OnNATProperties = noteNAT
 	secureEndpoint.OnConnect = func(c *nex.Connection) {
@@ -133,6 +134,7 @@ func main() {
 
 	secureEndpoint.StartReaper()
 	go startDashboard(secureEndpoint, mm)
+	startPresenceReporter()
 
 	proxyProto := os.Getenv("NEXTENDO_PROXY_PROTOCOL") == "1"
 	go func() {
@@ -148,23 +150,6 @@ func main() {
 		}
 	}()
 
-	// Raw PRUDP-V1-over-UDP secure listener, alongside the existing WSS one --
-	// see prudp_udp.go's package comment for why: the ARM32 decompile shows
-	// MHGU's actual connectionType-9 secure-connect code opens a real UDP
-	// socket, never a WebSocket, and Pretendo's proven MH4U server (same
-	// game engine lineage) listens with plain raw UDP for both auth and
-	// secure. Bound to the same port number as the WSS listener -- TCP and
-	// UDP are independent namespaces, so this doesn't conflict.
-	go func() {
-		udpServer := &nex.UDPServer{
-			Settings:  &secureSettings,
-			SecureKey: secureEndpoint.SecureKey,
-		}
-		if err := udpServer.ListenUDP(securePort); err != nil {
-			fmt.Printf("[MHGU Secure UDP] stopped: %v\n", err)
-		}
-	}()
-
 	fmt.Printf("[MHGU Secure] listening WSS :%d\n", securePort)
 	if err := secureServer.ListenSecure(securePort, certFile, keyFile); err != nil {
 		fmt.Printf("[MHGU Secure] stopped: %v\n", err)
@@ -174,17 +159,19 @@ func main() {
 // resolveUser: identical shape to every other Nextendo game server (see
 // mario-tennis-aces/main.go, the reference implementation for signed-token
 // enforcement).
-func resolveUser(username string, extraData []byte) (uint64, []byte, bool) {
-	fmt.Printf("[Auth][diag] raw extraData (%d bytes): %x\n", len(extraData), extraData)
+func resolveUser(username string, extraData []byte) (uint64, []byte, uint32) {
 	sk := sha256.Sum256([]byte("nextendo-src:" + username))
 	sourceKey := sk[:]
 
 	if pid, ok := nextendoPIDFromToken(username); ok {
+		if rc := versionResult(pid, extraData); rc != 0 {
+			return 0, nil, rc
+		}
 		if allow, reason := nextendoOnlineCheck(pid, "ryujinx"); !allow {
 			fmt.Printf("[Auth] pid=%d online REFUSED (%s)\n", pid, reason)
-			return 0, nil, false
+			return 0, nil, nex.ResultAuthTokenParseError
 		}
-		return pid, sourceKey, true
+		return pid, sourceKey, 0
 	}
 
 	if n, err := strconv.ParseUint(username, 10, 64); err == nil && n >= 1800000000 {
@@ -203,7 +190,10 @@ func resolveUser(username string, extraData []byte) (uint64, []byte, bool) {
 			}
 			if requireSignedToken() && !(proven && provenPID == n) {
 				fmt.Printf("[Auth] pid=%d REFUSED: identity not proven (signed nx2 token required)\n", n)
-				return 0, nil, false
+				return 0, nil, nex.ResultAuthTokenParseError
+			}
+			if rc := versionResult(n, extraData); rc != 0 {
+				return 0, nil, rc
 			}
 		}
 		pid, kind := n, "ryujinx"
@@ -215,24 +205,24 @@ func resolveUser(username string, extraData []byte) (uint64, []byte, bool) {
 				pid = rp
 			case nsaUnknown:
 				fmt.Printf("[Auth] NSA %d REFUSED (no Nextendo account)\n", n)
-				return 0, nil, false
+				return 0, nil, nex.ResultAuthTokenParseError
 			case nsaUnreachable:
 				fmt.Printf("[Auth] NSA %d REFUSED (account server unreachable)\n", n)
-				return 0, nil, false
+				return 0, nil, nex.ResultAuthTokenParseError
 			}
 		}
 		if allow, reason := nextendoOnlineCheck(pid, kind); !allow {
 			fmt.Printf("[Auth] pid=%d online REFUSED (%s)\n", pid, reason)
-			return 0, nil, false
+			return 0, nil, nex.ResultAuthTokenParseError
 		}
-		return pid, sourceKey, true
+		return pid, sourceKey, 0
 	}
 
 	if requireAccount {
 		fmt.Printf("[Auth] anonymous login REFUSED (Nextendo account required): %q\n", username)
-		return 0, nil, false
+		return 0, nil, nex.ResultAuthTokenParseError
 	}
-	return anonymousPID(username), sourceKey, true
+	return anonymousPID(username), sourceKey, 0
 }
 
 func nextendoPIDFromToken(s string) (uint64, bool) {
@@ -311,4 +301,30 @@ func envOrInt(key string, def int) int {
 func requireSignedToken() bool {
 	v := os.Getenv("NEXTENDO_REQUIRE_SIGNED_TOKEN")
 	return v == "1" || v == "true"
+}
+
+// versionResult returns 0 when the client may play, else the result code to reject it with.
+func versionResult(pid uint64, extraData []byte) uint32 {
+	if requiredVersion == "" {
+		return 0
+	}
+	got, ok := nex.TitleVersionFromLoginExtraData(extraData)
+	if !ok || got != requiredVersion {
+		fmt.Printf("[Auth] pid=%d online REFUSED (version=%q required=%q)\n", pid, got, requiredVersion)
+		return versionRejectResult()
+	}
+	return 0
+}
+
+func versionRejectResult() uint32 {
+	switch os.Getenv("NEXTENDO_VERSION_REJECT_CODE") {
+	case "unsupported":
+		return nex.ResultAuthUnsupportedVersion
+	case "clientold":
+		return nex.ResultAuthClientVersionIsOld
+	case "tokenparse":
+		return nex.ResultAuthTokenParseError
+	default:
+		return nex.ResultAuthApplicationVersionIsOld
+	}
 }
